@@ -31,6 +31,9 @@ from rich.console import Console
 from src.goal.context import default_goal_criteria
 from src.ui_services import build_run_analysis, load_run_context
 
+# Observability — OpenTelemetry tracing (no-op when OTEL_EXPORTER_OTLP_ENDPOINT is unset)
+from src.observability import init_tracing, instrument_fastapi, instrument_httpx
+
 # UTF-8 on Windows
 import sys as _sys
 for _s in ("stdout", "stderr"):
@@ -514,7 +517,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ----------------------------------------------------------------------------
+# OpenTelemetry tracing initialization (no-op when endpoint is unset)
+# ----------------------------------------------------------------------------
+init_tracing()
 
+# ----------------------------------------------------------------------------
 # ----------------------------------------------------------------------------
 # SPA deep-link fallback
 # ----------------------------------------------------------------------------
@@ -3059,7 +3067,7 @@ async def stop_runner_endpoint(payload: LiveRunnerControlRequest):
 # ============================================================================
 
 from src.api.alpha_routes import register_alpha_routes  # noqa: E402
-register_alpha_routes(app)
+register_alpha_routes(app, require_auth=require_auth, require_event_stream_auth=require_event_stream_auth)
 
 
 # ============================================================================
@@ -3123,6 +3131,10 @@ def serve_main(argv: list[str] | None = None) -> int:
     print("=" * 50)
 
     try:
+        # Auto-instrument FastAPI routes and outbound httpx calls
+        instrument_fastapi(app)
+        instrument_httpx()
+
         uvicorn.run(app, host=args.host, port=args.port, log_level="info")
     finally:
         if vite_proc:

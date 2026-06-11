@@ -30,6 +30,8 @@ from src.tools import build_swarm_registry
 from src.tools.mcp import MCPRemoteTool
 from src.tools.redaction import is_sensitive_arg, redact_payload
 
+from src.observability import get_tracer
+
 logger = logging.getLogger(__name__)
 
 _DEFAULT_MAX_ITERATIONS = int(os.getenv("SWARM_WORKER_MAX_ITER", "50"))
@@ -306,6 +308,13 @@ def run_worker(
     max_iterations = agent_spec.max_iterations or _DEFAULT_MAX_ITERATIONS
     timeout = agent_spec.timeout_seconds or _DEFAULT_TIMEOUT_SECONDS
 
+    worker_tracer = get_tracer("swarm.worker")
+    worker_span = worker_tracer.start_span("SwarmWorker.run")
+    worker_span.set_attribute("worker.agent_id", agent_id)
+    worker_span.set_attribute("worker.task_id", task_id)
+    worker_span.set_attribute("worker.role", agent_spec.role)
+    worker_span.set_attribute("worker.model", agent_spec.model_name or "default")
+
     _emit(event_callback, "worker_started", agent_id, task_id)
 
     # 1. Build per-worker tool registry — local pool plus any operator-
@@ -339,6 +348,9 @@ def run_worker(
     except (KeyError, ValueError) as exc:
         error_msg = f"Failed to render prompt template: {exc}"
         _emit(event_callback, "worker_failed", agent_id, task_id, {"error": error_msg})
+        worker_span.set_attribute("worker.status", "failed")
+        worker_span.set_attribute("worker.error", error_msg)
+        worker_span.end()
         return WorkerResult(
             status="failed", summary="", iterations=0, error=error_msg,
             input_tokens=0, output_tokens=0,
@@ -384,6 +396,9 @@ def run_worker(
             _emit(event_callback, "worker_timeout", agent_id, task_id, {"elapsed": elapsed})
             _write_summary(artifact_dir, summary)
             _persist_messages(artifact_dir, messages)
+            worker_span.set_attribute("worker.status", "timeout")
+            worker_span.set_attribute("worker.iterations", iteration)
+            worker_span.end()
             return WorkerResult(
                 status="timeout",
                 summary=summary,
@@ -400,6 +415,9 @@ def run_worker(
             summary = _resolve_summary(artifact_dir, summary)
             _emit(event_callback, "worker_token_limit", agent_id, task_id, {"tokens": token_estimate})
             _write_summary(artifact_dir, summary)
+            worker_span.set_attribute("worker.status", "token_limit")
+            worker_span.set_attribute("worker.iterations", iteration)
+            worker_span.end()
             return WorkerResult(
                 status="token_limit",
                 summary=summary,
@@ -466,6 +484,10 @@ def run_worker(
             error_msg = f"LLM call failed at iteration {iteration}: {exc}"
             logger.warning(error_msg)
             _emit(event_callback, "worker_failed", agent_id, task_id, {"error": error_msg})
+            worker_span.set_attribute("worker.status", "failed")
+            worker_span.set_attribute("worker.error", error_msg)
+            worker_span.set_attribute("worker.iterations", iteration)
+            worker_span.end()
             return WorkerResult(
                 status="failed",
                 summary=_resolve_summary(artifact_dir, last_assistant_content or ""),
@@ -499,6 +521,9 @@ def run_worker(
             if reason:
                 _emit(event_callback, "worker_incomplete", agent_id, task_id,
                       {"iterations": iteration + 1, "reason": reason})
+                worker_span.set_attribute("worker.status", "incomplete")
+                worker_span.set_attribute("worker.iterations", iteration + 1)
+                worker_span.end()
                 return WorkerResult(
                     status="incomplete",
                     summary=summary,
@@ -509,6 +534,9 @@ def run_worker(
                     output_tokens=total_output_tokens,
                 )
             _emit(event_callback, "worker_completed", agent_id, task_id, {"iterations": iteration + 1})
+            worker_span.set_attribute("worker.status", "completed")
+            worker_span.set_attribute("worker.iterations", iteration + 1)
+            worker_span.end()
             return WorkerResult(
                 status="completed",
                 summary=summary,
@@ -596,6 +624,9 @@ def run_worker(
             output_tokens=total_output_tokens,
         )
     _emit(event_callback, "worker_iteration_limit", agent_id, task_id)
+    worker_span.set_attribute("worker.status", "iteration_limit")
+    worker_span.set_attribute("worker.iterations", max_iterations)
+    worker_span.end()
     return WorkerResult(
         status="completed",
         summary=summary,

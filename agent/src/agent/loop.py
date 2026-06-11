@@ -35,6 +35,7 @@ from src.goal.context import (
 )
 from src.providers.chat import ChatLLM
 from src.tools.background_tools import get_background_manager
+from src.observability import get_tracer
 
 RUNS_DIR = Path(__file__).resolve().parents[2] / "runs"
 TOKEN_THRESHOLD = int(os.getenv("TOKEN_THRESHOLD", "40000"))
@@ -367,6 +368,10 @@ class AgentLoop:
         goal_last_progress: tuple[int, int] | None = None
         wrap_up_at = max(1, int(self.max_iterations * 0.8))
 
+        loop_tracer = get_tracer("agent.loop")
+        loop_span = loop_tracer.start_span("AgentLoop.run")
+        loop_span.set_attribute("session_id", session_id)
+        loop_span.set_attribute("max_iterations", self.max_iterations)
         try:
             while iteration < self.max_iterations:
                 if self._cancelled:
@@ -436,13 +441,24 @@ class AgentLoop:
                     on_text_chunk=_on_text_chunk,
                 )
                 usage = getattr(response, "usage_metadata", None) or {}
+                # Emit OTel span for this LLM call
+                llm_tracer = get_tracer("llm.chat")
+                llm_span = llm_tracer.start_span("LLM.stream_chat")
+                llm_span.set_attribute("iteration", iteration)
+                llm_span.set_attribute("has_tools", tool_defs is not None)
                 if usage:
+                    input_tokens = int(usage.get("input_tokens") or 0)
+                    output_tokens = int(usage.get("output_tokens") or 0)
+                    total_tokens = int(usage.get("total_tokens") or 0)
+                    llm_span.set_attribute("input_tokens", input_tokens)
+                    llm_span.set_attribute("output_tokens", output_tokens)
+                    llm_span.set_attribute("total_tokens", total_tokens)
                     self._emit(
                         "llm_usage",
                         {
-                            "input_tokens": int(usage.get("input_tokens") or 0),
-                            "output_tokens": int(usage.get("output_tokens") or 0),
-                            "total_tokens": int(usage.get("total_tokens") or 0),
+                            "input_tokens": input_tokens,
+                            "output_tokens": output_tokens,
+                            "total_tokens": total_tokens,
                             "iter": iteration,
                         },
                     )
@@ -476,6 +492,8 @@ class AgentLoop:
                 if thinking_text:
                     trace.write({"type": "thinking", "iter": iteration, "content": thinking_text[:2000]})
                     self._emit("thinking_done", {"iter": iteration, "content": thinking_text[:500]})
+
+                llm_span.end()
 
                 if not response.has_tool_calls:
                     final_content = response.content or ""
@@ -564,6 +582,9 @@ class AgentLoop:
 
         except Exception as exc:
             logger.exception(f"AgentLoop error: {exc}")
+            loop_span.set_attribute("error", True)
+            loop_span.set_attribute("error.message", str(exc))
+            loop_span.end()
             trace.write({"type": "end", "status": "error", "reason": str(exc), "iterations": iteration})
             trace.close()
             state_store.mark_failure(run_dir, str(exc))
@@ -603,6 +624,12 @@ class AgentLoop:
             end_event["reason"] = final_reason
         trace.write(end_event)
         trace.close()
+
+        loop_span.set_attribute("status", final_status)
+        loop_span.set_attribute("iterations", iteration)
+        if final_reason is not None:
+            loop_span.set_attribute("reason", final_reason)
+        loop_span.end()
 
         result: dict[str, Any] = {
             "status": final_status,
@@ -825,6 +852,9 @@ class AgentLoop:
 
         _set_emitter(_on_progress)
         t0 = _time.perf_counter()
+        tool_tracer = get_tracer("agent.tool")
+        tool_span = tool_tracer.start_span(f"Tool.{tool_name}")
+        tool_span.set_attribute("tool.name", tool_name)
         try:
             with HeartbeatTimer(
                 tool_name=tool_name,
@@ -835,6 +865,9 @@ class AgentLoop:
         finally:
             _set_emitter(None)
         elapsed_ms = int((_time.perf_counter() - t0) * 1000)
+        tool_span.set_attribute("status", "ok" if _is_tool_success(result) else "error")
+        tool_span.set_attribute("elapsed_ms", elapsed_ms)
+        tool_span.end()
         return result, elapsed_ms
 
     def _finalize_tool_result(

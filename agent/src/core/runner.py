@@ -12,6 +12,8 @@ from typing import Any, Dict, Optional
 
 from rich.console import Console
 
+from src.observability import get_tracer
+
 
 console = Console(stderr=True)
 
@@ -225,10 +227,15 @@ class Runner:
         start_time = time.time()
         console.print("[dim]Runner: starting backtest subprocess...[/dim]")
 
+        runner_tracer = get_tracer("core.runner")
+        runner_span = runner_tracer.start_span("Backtest.subprocess")
+        runner_span.set_attribute("script", str(entry_script))
+
         effective_cwd = cwd or entry_script.parent
         pythonpath_extra = cwd if cwd else None
         env = self._build_runtime_env(run_dir, pythonpath_extra=pythonpath_extra)
         python_cmd = self._pick_python_interpreter()
+        runner_span.set_attribute("python", python_cmd)
         console.print(f"[dim]Runner: using Python: {python_cmd}[/dim]")
 
         cmd = [python_cmd, str(entry_script)]
@@ -269,6 +276,10 @@ class Runner:
                 artifacts[name] = target
 
         success = process.returncode == 0
+        runner_span.set_attribute("exit_code", process.returncode)
+        runner_span.set_attribute("success", success)
+        runner_span.set_attribute("elapsed_sec", elapsed)
+        runner_span.end()
         return RunResult(
             success=success,
             exit_code=process.returncode,

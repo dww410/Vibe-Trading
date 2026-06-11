@@ -42,6 +42,8 @@ from src.swarm.task_store import (
 from src.tools.redaction import redact_internal_paths
 from src.swarm.worker import run_worker
 
+from src.observability import get_tracer
+
 logger = logging.getLogger(__name__)
 
 
@@ -232,6 +234,12 @@ class SwarmRuntime:
         run_id = run.id
         run_dir = self._store.run_dir(run_id)
 
+        swarm_tracer = get_tracer("swarm.runtime")
+        run_span = swarm_tracer.start_span("SwarmRun.execute")
+        run_span.set_attribute("run.id", run_id)
+        run_span.set_attribute("run.preset", run.preset_name)
+        run_span.set_attribute("run.task_count", len(run.tasks))
+
         # Mark as running
         run.status = RunStatus.running
         self._store.update_run(run)
@@ -275,17 +283,33 @@ class SwarmRuntime:
                 )
 
                 # Execute all tasks in this layer in parallel
-                layer_results = self._execute_layer(
-                    run=run,
-                    task_store=task_store,
-                    agent_map=agent_map,
-                    layer_task_ids=layer_task_ids,
-                    task_summaries=task_summaries,
-                    run_dir=run_dir,
-                    cancel_event=cancel_event,
-                    include_shell_tools=include_shell_tools,
-                    grounding_block=grounding_block,
-                )
+                layer_tracer = get_tracer("swarm.layer")
+                layer_span = layer_tracer.start_span(f"SwarmLayer.{layer_idx}")
+                layer_span.set_attribute("layer.index", layer_idx)
+                layer_span.set_attribute("layer.task_count", len(layer_task_ids))
+                layer_results: dict[str, WorkerResult] = {}
+                try:
+                    layer_results = self._execute_layer(
+                        run=run,
+                        task_store=task_store,
+                        agent_map=agent_map,
+                        layer_task_ids=layer_task_ids,
+                        task_summaries=task_summaries,
+                        run_dir=run_dir,
+                        cancel_event=cancel_event,
+                        include_shell_tools=include_shell_tools,
+                        grounding_block=grounding_block,
+                    )
+                finally:
+                    layer_span.set_attribute(
+                        "layer.completed",
+                        len([r for r in layer_results.values() if r.status == "completed"]),
+                    )
+                    layer_span.set_attribute(
+                        "layer.failed",
+                        len([r for r in layer_results.values() if r.status != "completed"]),
+                    )
+                    layer_span.end()
 
                 # Process results
                 for tid, result in layer_results.items():
@@ -367,6 +391,9 @@ class SwarmRuntime:
         final_status = (
             RunStatus.cancelled if cancel_event.is_set() else RunStatus.completed if all_succeeded else RunStatus.failed
         )
+        run_span.set_attribute("run.status", final_status.value)
+        run_span.set_attribute("run.completed", True)
+        run_span.end()
         run.status = final_status
         run.completed_at = datetime.now(timezone.utc).isoformat()
 
