@@ -4,7 +4,7 @@
 核心链路：K线 → 分型 → 笔 → 中枢 → 买卖点。
 """
 
-from typing import Optional, Dict
+from typing import Optional, Dict, Union
 from datetime import datetime
 
 import pandas as pd
@@ -18,7 +18,7 @@ from czsc.signals.cxt import (
 )
 
 
-def _df_to_bars(df: pd.DataFrame, symbol: str, freq: Freq = Freq.D) -> list:
+def _df_to_bars(df: pd.DataFrame, symbol: str, freq: Union[str, Freq] = "D") -> list:
     """将 OHLCV DataFrame 转换为 czsc RawBar 列表。
 
     Args:
@@ -29,6 +29,9 @@ def _df_to_bars(df: pd.DataFrame, symbol: str, freq: Freq = Freq.D) -> list:
     Returns:
         按时间正序排列的 RawBar 列表。
     """
+    if isinstance(freq, str):
+        freq = getattr(Freq, freq)
+
     bars = []
     for i, (dt, row) in enumerate(df.iterrows()):
         if not isinstance(dt, datetime):
@@ -93,7 +96,7 @@ class SignalEngine:
         freq: K线分析频率。
     """
 
-    def __init__(self, freq: Freq = Freq.D):
+    def __init__(self, freq: Union[str, Freq] = "D"):
         """初始化缠论信号引擎。
 
         Args:
@@ -121,67 +124,75 @@ class SignalEngine:
                 continue
 
             # 逐根K线分析，记录每根K线的信号
-            c = CZSC(bars[:30], get_signals=_get_signals)
+            c = CZSC(bars[:30])
             for bar in bars[30:]:
                 c.update(bar)
-                sig = self._evaluate_signals(c)
+                signals = _get_signals(c)
+                sig = self._evaluate_signals(c, signals)
                 if sig != 0:
                     signal.iloc[bar.id] = sig
 
             result[code] = signal
         return result
 
-    def _evaluate_signals(self, c: CZSC) -> int:
+    def _evaluate_signals(self, c: CZSC, signals: dict) -> int:
         """评估当前信号状态，返回交易方向。
 
         Args:
             c: CZSC 分析器实例。
+            signals: 信号字典。
 
         Returns:
             1=做多, -1=做空, 0=观望。
         """
-        signals = c.signals
         if not signals:
             return 0
 
+        def _v1(val: object) -> str:
+            s = str(val)
+            return s.split("_", 1)[0] if s else ""
+
         # 一买信号
-        buy1_key = [k for k in signals if "BUY1" in k]
-        if buy1_key and "一买" in str(signals.get(buy1_key[0], "")):
+        buy1_key = next((k for k in signals if "BUY1" in k), None)
+        if buy1_key and _v1(signals.get(buy1_key, "")) == "一买":
             return 1
 
         # 一卖信号
-        sell1_key = [k for k in signals if "SELL1" in k]
-        if sell1_key and "一卖" in str(signals.get(sell1_key[0], "")):
+        sell1_key = next((k for k in signals if "SELL1" in k), None)
+        if sell1_key and _v1(signals.get(sell1_key, "")) == "一卖":
             return -1
 
         # 三笔形态
-        three_bi_key = [k for k in signals if "三笔" in k]
+        three_bi_key = next((k for k in signals if "三笔" in k), None)
         if three_bi_key:
-            val = str(signals.get(three_bi_key[0], ""))
-            if "向上盘背" in val:
+            v1 = _v1(signals.get(three_bi_key, ""))
+            if v1 == "向上盘背":
                 return 1
-            if "向下盘背" in val:
+            if v1 == "向下盘背":
                 return -1
 
         # 五笔形态
-        five_bi_key = [k for k in signals if "五笔" in k]
+        five_bi_key = next((k for k in signals if "五笔" in k), None)
         if five_bi_key:
-            val = str(signals.get(five_bi_key[0], ""))
-            if "类一买" in val:
+            v1 = _v1(signals.get(five_bi_key, ""))
+            if v1 == "类一买":
                 return 1
-            if "类一卖" in val:
+            if v1 == "类一卖":
                 return -1
 
         # 笔基础信号 + 中枢位置辅助
-        bi_key = [k for k in signals if "V230228" in k]
+        bi_key = next((k for k in signals if "V230228" in k), None)
         if bi_key and len(c.bi_list) >= 3:
-            val = str(signals.get(bi_key[0], ""))
+            val = str(signals.get(bi_key, ""))
+            parts = val.split("_")
+            v1 = parts[0] if len(parts) > 0 else ""
+            v2 = parts[1] if len(parts) > 1 else ""
             zs = _check_zhongshu(c.bi_list)
             if zs and zs.is_valid:
                 last_close = c.bars_raw[-1].close
-                if "向下_转折" in val and last_close <= zs.zd:
+                if v1 == "向下" and v2 == "转折" and last_close <= zs.zd:
                     return 1
-                if "向上_转折" in val and last_close >= zs.zg:
+                if v1 == "向上" and v2 == "转折" and last_close >= zs.zg:
                     return -1
 
         return 0

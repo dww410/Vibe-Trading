@@ -91,5 +91,8 @@ AGENTS.md
 wiki/alpha-library/manifest.json
 wiki/alpha-library/content/
 graphify-out/
+<<<<<<< Updated upstream
 .graphifyignore
 
+=======
+>>>>>>> Stashed changes
